@@ -15,11 +15,20 @@ set -e  # Work even if somebody does "sh thisscript.sh".
 
 # Note: you can set XDG_DATA_HOME or VENV_PATH before running this script,
 # if you want to change where the virtual environment will be installed
-XDG_DATA_HOME=${XDG_DATA_HOME:-~/.local/share}
+
+# HOME might not be defined when being run through something like systemd
+if [ -z "$HOME" ]; then
+  HOME=~root
+fi
+if [ -z "$XDG_DATA_HOME" ]; then
+  XDG_DATA_HOME=~/.local/share
+fi
 VENV_NAME="letsencrypt"
-VENV_PATH=${VENV_PATH:-"$XDG_DATA_HOME/$VENV_NAME"}
+if [ -z "$VENV_PATH" ]; then
+  VENV_PATH="$XDG_DATA_HOME/$VENV_NAME"
+fi
 VENV_BIN="$VENV_PATH/bin"
-LE_AUTO_VERSION="0.8.1"
+LE_AUTO_VERSION="0.15.0"
 BASENAME=$(basename $0)
 USAGE="Usage: $BASENAME [OPTIONS]
 A self-updating wrapper script for the Certbot ACME client. When run, updates
@@ -32,9 +41,12 @@ Help for certbot itself cannot be provided until it is installed.
   --debug                                   attempt experimental installation
   -h, --help                                print this help
   -n, --non-interactive, --noninteractive   run without asking for user input
+  --no-bootstrap                            do not install OS dependencies
   --no-self-upgrade                         do not download updates
   --os-packages-only                        install OS dependencies and exit
   -v, --verbose                             provide more output
+  -q, --quiet                               provide only update/error output;
+                                            implies --non-interactive
 
 All arguments are accepted and forwarded to the Certbot client when run."
 
@@ -48,19 +60,26 @@ for arg in "$@" ; do
       # Do not upgrade this script (also prevents client upgrades, because each
       # copy of the script pins a hash of the python client)
       NO_SELF_UPGRADE=1;;
+    --no-bootstrap)
+      NO_BOOTSTRAP=1;;
     --help)
       HELP=1;;
-    --noninteractive|--non-interactive)
+    --noninteractive|--non-interactive|renew)
       ASSUME_YES=1;;
+    --quiet)
+      QUIET=1;;
     --verbose)
       VERBOSE=1;;
     -[!-]*)
-      while getopts ":hnv" short_arg $arg; do
+      OPTIND=1
+      while getopts ":hnvq" short_arg $arg; do
         case "$short_arg" in
           h)
             HELP=1;;
           n)
             ASSUME_YES=1;;
+          q)
+            QUIET=1;;
           v)
             VERBOSE=1;;
         esac
@@ -74,56 +93,109 @@ if [ $BASENAME = "letsencrypt-auto" ]; then
   HELP=0
 fi
 
+# Set ASSUME_YES to 1 if QUIET (i.e. --quiet implies --non-interactive)
+if [ "$QUIET" = 1 ]; then
+  ASSUME_YES=1
+fi
+
+say() {
+    if [  "$QUIET" != 1 ]; then
+        echo "$@"
+    fi
+}
+
+error() {
+    echo "$@"
+}
+
+# Support for busybox and others where there is no "command",
+# but "which" instead
+if command -v command > /dev/null 2>&1 ; then
+  export EXISTS="command -v"
+elif which which > /dev/null 2>&1 ; then
+  export EXISTS="which"
+else
+  error "Cannot find command nor which... please install one!"
+  exit 1
+fi
+
 # certbot-auto needs root access to bootstrap OS dependencies, and
 # certbot itself needs root access for almost all modes of operation
 # The "normal" case is that sudo is used for the steps that need root, but
 # this script *can* be run as root (not recommended), or fall back to using
-# `su`
+# `su`. Auto-detection can be overridden by explicitly setting the
+# environment variable LE_AUTO_SUDO to 'sudo', 'sudo_su' or '' as used below.
+
+# Because the parameters in `su -c` has to be a string,
+# we need to properly escape it.
+su_sudo() {
+  args=""
+  # This `while` loop iterates over all parameters given to this function.
+  # For each parameter, all `'` will be replace by `'"'"'`, and the escaped string
+  # will be wrapped in a pair of `'`, then appended to `$args` string
+  # For example, `echo "It's only 1\$\!"` will be escaped to:
+  #   'echo' 'It'"'"'s only 1$!'
+  #     │       │└┼┘│
+  #     │       │ │ └── `'s only 1$!'` the literal string
+  #     │       │ └── `\"'\"` is a single quote (as a string)
+  #     │       └── `'It'`, to be concatenated with the strings following it
+  #     └── `echo` wrapped in a pair of `'`, it's totally fine for the shell command itself
+  while [ $# -ne 0 ]; do
+    args="$args'$(printf "%s" "$1" | sed -e "s/'/'\"'\"'/g")' "
+    shift
+  done
+  su root -c "$args"
+}
+
 SUDO_ENV=""
 export CERTBOT_AUTO="$0"
-if test "`id -u`" -ne "0" ; then
-  if command -v sudo 1>/dev/null 2>&1; then
-    SUDO=sudo
-    SUDO_ENV="CERTBOT_AUTO=$0"
-  else
-    echo \"sudo\" is not available, will use \"su\" for installation steps...
-    # Because the parameters in `su -c` has to be a string,
-    # we need properly escape it
-    su_sudo() {
-      args=""
-      # This `while` loop iterates over all parameters given to this function.
-      # For each parameter, all `'` will be replace by `'"'"'`, and the escaped string
-      # will be wrapped in a pair of `'`, then appended to `$args` string
-      # For example, `echo "It's only 1\$\!"` will be escaped to:
-      #   'echo' 'It'"'"'s only 1$!'
-      #     │       │└┼┘│
-      #     │       │ │ └── `'s only 1$!'` the literal string
-      #     │       │ └── `\"'\"` is a single quote (as a string)
-      #     │       └── `'It'`, to be concatenated with the strings following it
-      #     └── `echo` wrapped in a pair of `'`, it's totally fine for the shell command itself
-      while [ $# -ne 0 ]; do
-        args="$args'$(printf "%s" "$1" | sed -e "s/'/'\"'\"'/g")' "
-        shift
-      done
-      su root -c "$args"
-    }
-    SUDO=su_sudo
-  fi
+if [ -n "${LE_AUTO_SUDO+x}" ]; then
+  case "$LE_AUTO_SUDO" in
+    su_sudo|su)
+      SUDO=su_sudo
+      ;;
+    sudo)
+      SUDO=sudo
+      SUDO_ENV="CERTBOT_AUTO=$0"
+      ;;
+    '') ;; # Nothing to do for plain root method.
+    *)
+      error "Error: unknown root authorization mechanism '$LE_AUTO_SUDO'."
+      exit 1
+  esac
+  say "Using preset root authorization mechanism '$LE_AUTO_SUDO'."
 else
-  SUDO=
+  if test "`id -u`" -ne "0" ; then
+    if $EXISTS sudo 1>/dev/null 2>&1; then
+      SUDO=sudo
+      SUDO_ENV="CERTBOT_AUTO=$0"
+    else
+      say \"sudo\" is not available, will use \"su\" for installation steps...
+      SUDO=su_sudo
+    fi
+  else
+    SUDO=
+  fi
 fi
+
+BootstrapMessage() {
+  # Arguments: Platform name
+  say "Bootstrapping dependencies for $1... (you can skip this with --no-bootstrap)"
+}
 
 ExperimentalBootstrap() {
   # Arguments: Platform name, bootstrap function name
   if [ "$DEBUG" = 1 ]; then
     if [ "$2" != "" ]; then
-      echo "Bootstrapping dependencies via $1..."
+      BootstrapMessage $1
       $2
     fi
   else
-    echo "WARNING: $1 support is very experimental at present..."
-    echo "if you would like to work on improving it, please ensure you have backups"
-    echo "and then run this script again with the --debug flag!"
+    error "FATAL: $1 support is very experimental at present..."
+    error "if you would like to work on improving it, please ensure you have backups"
+    error "and then run this script again with the --debug flag!"
+    error "Alternatively, you can install OS dependencies yourself and run this script"
+    error "again with --no-bootstrap."
     exit 1
   fi
 }
@@ -131,18 +203,18 @@ ExperimentalBootstrap() {
 DeterminePythonVersion() {
   for LE_PYTHON in "$LE_PYTHON" python2.7 python27 python2 python; do
     # Break (while keeping the LE_PYTHON value) if found.
-    command -v "$LE_PYTHON" > /dev/null && break
+    $EXISTS "$LE_PYTHON" > /dev/null && break
   done
   if [ "$?" != "0" ]; then
-    echo "Cannot find any Pythons; please install one!"
+    error "Cannot find any Pythons; please install one!"
     exit 1
   fi
   export LE_PYTHON
 
   PYVER=`"$LE_PYTHON" -V 2>&1 | cut -d" " -f 2 | cut -d. -f1,2 | sed 's/\.//'`
   if [ "$PYVER" -lt 26 ]; then
-    echo "You have an ancient version of Python entombed in your operating system..."
-    echo "This isn't going to work; you'll need at least version 2.6."
+    error "You have an ancient version of Python entombed in your operating system..."
+    error "This isn't going to work; you'll need at least version 2.6."
     exit 1
   fi
 }
@@ -166,14 +238,21 @@ BootstrapDebCommon() {
   #
   # - Debian 6.0.10 "squeeze" (x64)
 
-  $SUDO apt-get update || echo apt-get update hit problems but continuing anyway...
+  if [ "$QUIET" = 1 ]; then
+    QUIET_FLAG='-qq'
+  fi
+
+  $SUDO apt-get $QUIET_FLAG update || error apt-get update hit problems but continuing anyway...
 
   # virtualenv binary can be found in different packages depending on
   # distro version (#346)
 
   virtualenv=
-  if apt-cache show virtualenv > /dev/null 2>&1 && ! apt-cache --quiet=0 show virtualenv 2>&1 | grep -q 'No packages found'; then
-    virtualenv="virtualenv"
+  # virtual env is known to apt and is installable
+  if apt-cache show virtualenv > /dev/null 2>&1 ; then
+    if ! LC_ALL=C apt-cache --quiet=0 show virtualenv 2>&1 | grep -q 'No packages found'; then
+      virtualenv="virtualenv"
+    fi
   fi
 
   if apt-cache show python-virtualenv > /dev/null 2>&1; then
@@ -181,78 +260,77 @@ BootstrapDebCommon() {
   fi
 
   augeas_pkg="libaugeas0 augeas-lenses"
-  AUGVERSION=`apt-cache show --no-all-versions libaugeas0 | grep ^Version: | cut -d" " -f2`
+  AUGVERSION=`LC_ALL=C apt-cache show --no-all-versions libaugeas0 | grep ^Version: | cut -d" " -f2`
 
   if [ "$ASSUME_YES" = 1 ]; then
     YES_FLAG="-y"
   fi
 
   AddBackportRepo() {
-      # ARGS:
-      BACKPORT_NAME="$1"
-      BACKPORT_SOURCELINE="$2"
-      echo "To use the Apache Certbot plugin, augeas needs to be installed from $BACKPORT_NAME."
-      if ! grep -v -e ' *#' /etc/apt/sources.list | grep -q "$BACKPORT_NAME" ; then
-          # This can theoretically error if sources.list.d is empty, but in that case we don't care.
-          if ! grep -v -e ' *#' /etc/apt/sources.list.d/* 2>/dev/null | grep -q "$BACKPORT_NAME"; then
-              if [ "$ASSUME_YES" = 1 ]; then
-                  /bin/echo -n "Installing augeas from $BACKPORT_NAME in 3 seconds..."
-                  sleep 1s
-                  /bin/echo -ne "\e[0K\rInstalling augeas from $BACKPORT_NAME in 2 seconds..."
-                  sleep 1s
-                  /bin/echo -e "\e[0K\rInstalling augeas from $BACKPORT_NAME in 1 second ..."
-                  sleep 1s
-                  add_backports=1
-              else
-                  read -p "Would you like to enable the $BACKPORT_NAME repository [Y/n]? " response
-                  case $response in
-                      [yY][eE][sS]|[yY]|"")
-                          add_backports=1;;
-                      *)
-                          add_backports=0;;
-                  esac
-              fi
-              if [ "$add_backports" = 1 ]; then
-                  $SUDO sh -c "echo $BACKPORT_SOURCELINE >> /etc/apt/sources.list.d/$BACKPORT_NAME.list"
-                  $SUDO apt-get update
-              fi
-          fi
+    # ARGS:
+    BACKPORT_NAME="$1"
+    BACKPORT_SOURCELINE="$2"
+    say "To use the Apache Certbot plugin, augeas needs to be installed from $BACKPORT_NAME."
+    if ! grep -v -e ' *#' /etc/apt/sources.list | grep -q "$BACKPORT_NAME" ; then
+      # This can theoretically error if sources.list.d is empty, but in that case we don't care.
+      if ! grep -v -e ' *#' /etc/apt/sources.list.d/* 2>/dev/null | grep -q "$BACKPORT_NAME"; then
+        if [ "$ASSUME_YES" = 1 ]; then
+          /bin/echo -n "Installing augeas from $BACKPORT_NAME in 3 seconds..."
+          sleep 1s
+          /bin/echo -ne "\e[0K\rInstalling augeas from $BACKPORT_NAME in 2 seconds..."
+          sleep 1s
+          /bin/echo -e "\e[0K\rInstalling augeas from $BACKPORT_NAME in 1 second ..."
+          sleep 1s
+          add_backports=1
+        else
+          read -p "Would you like to enable the $BACKPORT_NAME repository [Y/n]? " response
+          case $response in
+            [yY][eE][sS]|[yY]|"")
+              add_backports=1;;
+            *)
+              add_backports=0;;
+          esac
+        fi
+        if [ "$add_backports" = 1 ]; then
+          $SUDO sh -c "echo $BACKPORT_SOURCELINE >> /etc/apt/sources.list.d/$BACKPORT_NAME.list"
+          $SUDO apt-get $QUIET_FLAG update
+        fi
       fi
-      if [ "$add_backports" != 0 ]; then
-          $SUDO apt-get install $YES_FLAG --no-install-recommends -t "$BACKPORT_NAME" $augeas_pkg
-          augeas_pkg=
-      fi
+    fi
+    if [ "$add_backports" != 0 ]; then
+      $SUDO apt-get install $QUIET_FLAG $YES_FLAG --no-install-recommends -t "$BACKPORT_NAME" $augeas_pkg
+      augeas_pkg=
+    fi
   }
 
 
   if dpkg --compare-versions 1.0 gt "$AUGVERSION" ; then
-      if lsb_release -a | grep -q wheezy ; then
-          AddBackportRepo wheezy-backports "deb http://http.debian.net/debian wheezy-backports main"
-      elif lsb_release -a | grep -q precise ; then
-          # XXX add ARM case
-          AddBackportRepo precise-backports "deb http://archive.ubuntu.com/ubuntu precise-backports main restricted universe multiverse"
-      else
-          echo "No libaugeas0 version is available that's new enough to run the"
-          echo "Certbot apache plugin..."
-      fi
-      # XXX add a case for ubuntu PPAs
+    if lsb_release -a | grep -q wheezy ; then
+      AddBackportRepo wheezy-backports "deb http://http.debian.net/debian wheezy-backports main"
+    elif lsb_release -a | grep -q precise ; then
+      # XXX add ARM case
+      AddBackportRepo precise-backports "deb http://archive.ubuntu.com/ubuntu precise-backports main restricted universe multiverse"
+    else
+      echo "No libaugeas0 version is available that's new enough to run the"
+      echo "Certbot apache plugin..."
+    fi
+    # XXX add a case for ubuntu PPAs
   fi
 
-  $SUDO apt-get install $YES_FLAG --no-install-recommends \
+  $SUDO apt-get install $QUIET_FLAG $YES_FLAG --no-install-recommends \
     python \
     python-dev \
     $virtualenv \
     gcc \
-    dialog \
     $augeas_pkg \
     libssl-dev \
+    openssl \
     libffi-dev \
     ca-certificates \
 
 
-
-  if ! command -v virtualenv > /dev/null ; then
-    echo Failed to install a working \"virtualenv\" command, exiting
+  if ! $EXISTS virtualenv > /dev/null ; then
+    error Failed to install a working \"virtualenv\" command, exiting
     exit 1
   fi
 }
@@ -272,13 +350,39 @@ BootstrapRpmCommon() {
     tool=yum
 
   else
-    echo "Neither yum nor dnf found. Aborting bootstrap!"
+    error "Neither yum nor dnf found. Aborting bootstrap!"
     exit 1
+  fi
+
+  if [ "$ASSUME_YES" = 1 ]; then
+    yes_flag="-y"
+  fi
+  if [ "$QUIET" = 1 ]; then
+    QUIET_FLAG='--quiet'
+  fi
+
+  if ! $SUDO $tool list *virtualenv >/dev/null 2>&1; then
+    echo "To use Certbot, packages from the EPEL repository need to be installed."
+    if ! $SUDO $tool list epel-release >/dev/null 2>&1; then
+      error "Enable the EPEL repository and try running Certbot again."
+      exit 1
+    fi
+    if [ "$ASSUME_YES" = 1 ]; then
+      /bin/echo -n "Enabling the EPEL repository in 3 seconds..."
+      sleep 1s
+      /bin/echo -ne "\e[0K\rEnabling the EPEL repository in 2 seconds..."
+      sleep 1s
+      /bin/echo -e "\e[0K\rEnabling the EPEL repository in 1 seconds..."
+      sleep 1s
+    fi
+    if ! $SUDO $tool install $yes_flag $QUIET_FLAG epel-release; then
+      error "Could not enable EPEL. Aborting bootstrap!"
+      exit 1
+    fi
   fi
 
   pkgs="
     gcc
-    dialog
     augeas-libs
     openssl
     openssl-devel
@@ -313,13 +417,9 @@ BootstrapRpmCommon() {
     "
   fi
 
-  if [ "$ASSUME_YES" = 1 ]; then
-    yes_flag="-y"
-  fi
-
-  if ! $SUDO $tool install $yes_flag $pkgs; then
-      echo "Could not install OS dependencies. Aborting bootstrap!"
-      exit 1
+  if ! $SUDO $tool install $yes_flag $QUIET_FLAG $pkgs; then
+    error "Could not install OS dependencies. Aborting bootstrap!"
+    exit 1
   fi
 }
 
@@ -331,12 +431,15 @@ BootstrapSuseCommon() {
     install_flags="-l"
   fi
 
-  $SUDO zypper $zypper_flags in $install_flags \
+  if [ "$QUIET" = 1 ]; then
+    QUIET_FLAG='-qq'
+  fi
+
+  $SUDO zypper $QUIET_FLAG $zypper_flags in $install_flags \
     python \
     python-devel \
     python-virtualenv \
     gcc \
-    dialog \
     augeas-lenses \
     libopenssl-devel \
     libffi-devel \
@@ -355,7 +458,6 @@ BootstrapArchCommon() {
     python2
     python-virtualenv
     gcc
-    dialog
     augeas
     openssl
     libffi
@@ -371,7 +473,11 @@ BootstrapArchCommon() {
   fi
 
   if [ "$missing" ]; then
-    $SUDO pacman -S --needed $missing $noconfirm
+    if [ "$QUIET" = 1]; then
+      $SUDO pacman -S --needed $missing $noconfirm > /dev/null
+    else
+      $SUDO pacman -S --needed $missing $noconfirm
+    fi
   fi
 }
 
@@ -379,28 +485,36 @@ BootstrapGentooCommon() {
   PACKAGES="
     dev-lang/python:2.7
     dev-python/virtualenv
-    dev-util/dialog
     app-admin/augeas
     dev-libs/openssl
     dev-libs/libffi
     app-misc/ca-certificates
     virtual/pkgconfig"
 
+  ASK_OPTION="--ask"
+  if [ "$ASSUME_YES" = 1 ]; then
+    ASK_OPTION=""
+  fi
+
   case "$PACKAGE_MANAGER" in
     (paludis)
       $SUDO cave resolve --preserve-world --keep-targets if-possible $PACKAGES -x
       ;;
     (pkgcore)
-      $SUDO pmerge --noreplace --oneshot $PACKAGES
+      $SUDO pmerge --noreplace --oneshot $ASK_OPTION $PACKAGES
       ;;
     (portage|*)
-      $SUDO emerge --noreplace --oneshot $PACKAGES
+      $SUDO emerge --noreplace --oneshot $ASK_OPTION $PACKAGES
       ;;
   esac
 }
 
 BootstrapFreeBsd() {
-  $SUDO pkg install -Ay \
+  if [ "$QUIET" = 1 ]; then
+    QUIET_FLAG="--quiet"
+  fi
+
+  $SUDO pkg install -Ay $QUIET_FLAG \
     python \
     py27-virtualenv \
     augeas \
@@ -409,47 +523,46 @@ BootstrapFreeBsd() {
 
 BootstrapMac() {
   if hash brew 2>/dev/null; then
-    echo "Using Homebrew to install dependencies..."
+    say "Using Homebrew to install dependencies..."
     pkgman=brew
     pkgcmd="brew install"
   elif hash port 2>/dev/null; then
-    echo "Using MacPorts to install dependencies..."
+    say "Using MacPorts to install dependencies..."
     pkgman=port
     pkgcmd="$SUDO port install"
   else
-    echo "No Homebrew/MacPorts; installing Homebrew..."
+    say "No Homebrew/MacPorts; installing Homebrew..."
     ruby -e "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"
     pkgman=brew
     pkgcmd="brew install"
   fi
 
   $pkgcmd augeas
-  $pkgcmd dialog
   if [ "$(which python)" = "/System/Library/Frameworks/Python.framework/Versions/2.7/bin/python" \
       -o "$(which python)" = "/usr/bin/python" ]; then
     # We want to avoid using the system Python because it requires root to use pip.
     # python.org, MacPorts or HomeBrew Python installations should all be OK.
-    echo "Installing python..."
+    say "Installing python..."
     $pkgcmd python
   fi
 
-  # Workaround for _dlopen not finding augeas on OS X
+  # Workaround for _dlopen not finding augeas on macOS
   if [ "$pkgman" = "port" ] && ! [ -e "/usr/local/lib/libaugeas.dylib" ] && [ -e "/opt/local/lib/libaugeas.dylib" ]; then
-    echo "Applying augeas workaround"
+    say "Applying augeas workaround"
     $SUDO mkdir -p /usr/local/lib/
     $SUDO ln -s /opt/local/lib/libaugeas.dylib /usr/local/lib/
   fi
 
   if ! hash pip 2>/dev/null; then
-      echo "pip not installed"
-      echo "Installing pip..."
-      curl --silent --show-error --retry 5 https://bootstrap.pypa.io/get-pip.py | python
+    say "pip not installed"
+    say "Installing pip..."
+    curl --silent --show-error --retry 5 https://bootstrap.pypa.io/get-pip.py | python
   fi
 
   if ! hash virtualenv 2>/dev/null; then
-      echo "virtualenv not installed."
-      echo "Installing with pip..."
-      pip install virtualenv
+    say "virtualenv not installed."
+    say "Installing with pip..."
+    pip install virtualenv
   fi
 }
 
@@ -459,54 +572,59 @@ BootstrapSmartOS() {
 }
 
 BootstrapMageiaCommon() {
-    if ! $SUDO urpmi --force  \
-           python \
-           libpython-devel \
-           python-virtualenv
-    then
-      echo "Could not install Python dependencies. Aborting bootstrap!"
-      exit 1
-    fi
+  if [ "$QUIET" = 1 ]; then
+    QUIET_FLAG='--quiet'
+  fi
 
-    if ! $SUDO urpmi --force \
-           git \
-           gcc \
-           cdialog \
-           python-augeas \
-           libopenssl-devel \
-           libffi-devel \
-           rootcerts
+  if ! $SUDO urpmi --force $QUIET_FLAG \
+      python \
+      libpython-devel \
+      python-virtualenv
     then
-        echo "Could not install additional dependencies. Aborting bootstrap!"
-        exit 1
+      error "Could not install Python dependencies. Aborting bootstrap!"
+      exit 1
+  fi
+
+  if ! $SUDO urpmi --force $QUIET_FLAG \
+      git \
+      gcc \
+      python-augeas \
+      libopenssl-devel \
+      libffi-devel \
+      rootcerts
+    then
+      error "Could not install additional dependencies. Aborting bootstrap!"
+      exit 1
     fi
 }
 
 
 # Install required OS packages:
 Bootstrap() {
-  if [ -f /etc/debian_version ]; then
-    echo "Bootstrapping dependencies for Debian-based OSes..."
+  if [ "$NO_BOOTSTRAP" = 1 ]; then
+      return
+  elif [ -f /etc/debian_version ]; then
+    BootstrapMessage "Debian-based OSes"
     BootstrapDebCommon
-  elif [ -f /etc/mageia-release ] ; then
+  elif [ -f /etc/mageia-release ]; then
     # Mageia has both /etc/mageia-release and /etc/redhat-release
     ExperimentalBootstrap "Mageia" BootstrapMageiaCommon
   elif [ -f /etc/redhat-release ]; then
-    echo "Bootstrapping dependencies for RedHat-based OSes..."
+    BootstrapMessage "RedHat-based OSes"
     BootstrapRpmCommon
   elif [ -f /etc/os-release ] && `grep -q openSUSE /etc/os-release` ; then
-    echo "Bootstrapping dependencies for openSUSE-based OSes..."
+    BootstrapMessage "openSUSE-based OSes"
     BootstrapSuseCommon
   elif [ -f /etc/arch-release ]; then
     if [ "$DEBUG" = 1 ]; then
-      echo "Bootstrapping dependencies for Archlinux..."
+      BootstrapMessage "Archlinux"
       BootstrapArchCommon
     else
-      echo "Please use pacman to install letsencrypt packages:"
-      echo "# pacman -S certbot certbot-apache"
-      echo
-      echo "If you would like to use the virtualenv way, please run the script again with the"
-      echo "--debug flag."
+      error "Please use pacman to install letsencrypt packages:"
+      error "# pacman -S certbot certbot-apache"
+      error
+      error "If you would like to use the virtualenv way, please run the script again with the"
+      error "--debug flag."
       exit 1
     fi
   elif [ -f /etc/manjaro-release ]; then
@@ -516,23 +634,23 @@ Bootstrap() {
   elif uname | grep -iq FreeBSD ; then
     ExperimentalBootstrap "FreeBSD" BootstrapFreeBsd
   elif uname | grep -iq Darwin ; then
-    ExperimentalBootstrap "Mac OS X" BootstrapMac
+    ExperimentalBootstrap "macOS" BootstrapMac
   elif [ -f /etc/issue ] && grep -iq "Amazon Linux" /etc/issue ; then
     ExperimentalBootstrap "Amazon Linux" BootstrapRpmCommon
   elif [ -f /etc/product ] && grep -q "Joyent Instance" /etc/product ; then
     ExperimentalBootstrap "Joyent SmartOS Zone" BootstrapSmartOS
   else
-    echo "Sorry, I don't know how to bootstrap Certbot on your operating system!"
-    echo
-    echo "You will need to bootstrap, configure virtualenv, and run pip install manually."
-    echo "Please see https://letsencrypt.readthedocs.org/en/latest/contributing.html#prerequisites"
-    echo "for more info."
+    error "Sorry, I don't know how to bootstrap Certbot on your operating system!"
+    error
+    error "You will need to install OS dependencies, configure virtualenv, and run pip install manually."
+    error "Please see https://letsencrypt.readthedocs.org/en/latest/contributing.html#prerequisites"
+    error "for more info."
     exit 1
   fi
 }
 
 TempDir() {
-  mktemp -d 2>/dev/null || mktemp -d -t 'le'  # Linux || OS X
+  mktemp -d 2>/dev/null || mktemp -d -t 'le'  # Linux || macOS
 }
 
 
@@ -545,11 +663,16 @@ if [ "$1" = "--le-auto-phase2" ]; then
     # --version output ran through grep due to python-cryptography DeprecationWarnings
     # grep for both certbot and letsencrypt until certbot and shim packages have been released
     INSTALLED_VERSION=$("$VENV_BIN/letsencrypt" --version 2>&1 | grep "^certbot\|^letsencrypt" | cut -d " " -f 2)
+    if [ -z "$INSTALLED_VERSION" ]; then
+        error "Error: couldn't get currently installed version for $VENV_BIN/letsencrypt: " 1>&2
+        "$VENV_BIN/letsencrypt" --version
+        exit 1
+    fi
   else
     INSTALLED_VERSION="none"
   fi
   if [ "$LE_AUTO_VERSION" != "$INSTALLED_VERSION" ]; then
-    echo "Creating virtual environment..."
+    say "Creating virtual environment..."
     DeterminePythonVersion
     rm -rf "$VENV_PATH"
     if [ "$VERBOSE" = 1 ]; then
@@ -558,15 +681,21 @@ if [ "$1" = "--le-auto-phase2" ]; then
       virtualenv --no-site-packages --python "$LE_PYTHON" "$VENV_PATH" > /dev/null
     fi
 
-    echo "Installing Python packages..."
+    say "Installing Python packages..."
     TEMP_DIR=$(TempDir)
     trap 'rm -rf "$TEMP_DIR"' EXIT
     # There is no $ interpolation due to quotes on starting heredoc delimiter.
     # -------------------------------------------------------------------------
     cat << "UNLIKELY_EOF" > "$TEMP_DIR/letsencrypt-auto-requirements.txt"
 # This is the flattened list of packages certbot-auto installs. To generate
-# this, do `pip install --no-cache-dir -e acme -e . -e certbot-apache`, and
-# then use `hashin` or a more secure method to gather the hashes.
+# this, do
+# `pip install --no-cache-dir -e acme -e . -e certbot-apache -e certbot-nginx`,
+# and then use `hashin` or a more secure method to gather the hashes.
+
+# Hashin example:
+# pip install hashin
+# hashin -r dependency-requirements.txt cryptography==1.5.2
+# sets the new certbot-auto pinned version of cryptography to 1.5.2
 
 argparse==1.4.0 \
     --hash=sha256:c31647edb69fd3d465a847ea3157d37bed1f95f19760b11a47aa91c04b666314 \
@@ -575,8 +704,12 @@ argparse==1.4.0 \
 # This comes before cffi because cffi will otherwise install an unchecked
 # version via setup_requires.
 pycparser==2.14 \
-    --hash=sha256:7959b4a74abdc27b312fed1c21e6caf9309ce0b29ea86b591fd2e99ecdf27f73
+    --hash=sha256:7959b4a74abdc27b312fed1c21e6caf9309ce0b29ea86b591fd2e99ecdf27f73 \
+    --no-binary pycparser
 
+asn1crypto==0.22.0 \
+    --hash=sha256:d232509fefcfcdb9a331f37e9c9dc20441019ad927c7d2176cf18ed5da0ba097 \
+    --hash=sha256:cbbadd640d3165ab24b06ef25d1dca09a3441611ac15f6a6b452474fdf0aed1a
 cffi==1.4.2 \
     --hash=sha256:53c1c9ddb30431513eb7f3cdef0a3e06b0f1252188aaa7744af0f5a4cd45dbaf \
     --hash=sha256:a568f49dfca12a8d9f370187257efc58a38109e1eee714d928561d7a018a64f8 \
@@ -598,98 +731,76 @@ ConfigArgParse==0.10.0 \
     --hash=sha256:3b50a83dd58149dfcee98cb6565265d10b53e9c0a2bca7eeef7fb5f5524890a7
 configobj==5.0.6 \
     --hash=sha256:a2f5650770e1c87fb335af19a9b7eb73fc05ccf22144eb68db7d00cd2bcb0902
-cryptography==1.2.3 \
-    --hash=sha256:031938f73a5c5eb3e809e18ff7caeb6865351871417be6050cb8c86a9a202b9a \
-    --hash=sha256:a179a38d50f8d68b491d7a313db78f8cabe290842cecddddc7b34d408e59db0a \
-    --hash=sha256:906c88b2aadcf99cfabb24098263d1bf65ab0c8688acde10dae1f09d865920f1 \
-    --hash=sha256:6e706c5c6088770b1d1b634e959e21963e315b0255f5f4777125ad3d54082977 \
-    --hash=sha256:f5ebf8e31c48f8707921dca0e994de77813a9c9b9bf03c119c5ddf97bdcffe73 \
-    --hash=sha256:c7b89e42288cc7fbee3812e99ef5c744f22452e11d6822f6807afc6d6b3be83e \
-    --hash=sha256:8408d29865947109d8b68f1837a7cde1aa4dc86e0f79ca3ba58c0c44e443d6a5 \
-    --hash=sha256:c7e76cf3c3d925dd31fa238cfb806cffba718c0f08707d77a538768477969956 \
-    --hash=sha256:7d8de35380f31702758b7753bb5c40723832c73006dedb2f9099bf61a37f7287 \
-    --hash=sha256:5edbee71fae5469ee83fe0a37866b9398c8ce3a46325c24fcedfbf097bb48a19 \
-    --hash=sha256:594edafe4801c13bdc1cc305e7704a90c19617e95936f6ab457ee4ffe000ba50 \
-    --hash=sha256:b7fdb16a0a7f481be42da744bfe1ea2163025de21f90f2c688a316f3c354da9c \
-    --hash=sha256:207b8bf0fe0907336df38b733b487521cf9e138189aba9234ad54fe545dd0db8 \
-    --hash=sha256:509a2f05386270cf783993c90d49ffefb3dd62aee45bf1ea8ce3d2cde7271c21 \
-    --hash=sha256:ac69b65dd1af0179ede40c9f15788c88f73e628ea6c0519de3838e279bb388c6 \
-    --hash=sha256:8df6fad6c6ae12fd7004ea29357f0a2b4d3774eaeca7656530d08d2d90cd41aa \
-    --hash=sha256:0b8b96dd81cc1533a04f30382c0fe21c1972e189f794d0c4261a18cec08fd9b5 \
-    --hash=sha256:cae8fca1883f23c50ea78d89de6fe4fefdb4cea83177760f47177559414ded93 \
-    --hash=sha256:1a471ca576a9cdce1b1cd9f3a22b1d09ee44d46862037557de17919c0db44425 \
-    --hash=sha256:8ec4e8e3d453b3a1b63b5f57737a434dcf1ee4a2f26f6ff7c5a37c3f679104d2 \
-    --hash=sha256:8eb11c77dd8e73f48df6b2f7a7e16173fe0fe8fdfe266232832e88477e08454e
+cryptography==1.8.2 \
+    --hash=sha256:e572527dc4eae300d4ac58c3a49fd0fe1a0178baf341f536d22c45455c958410 \
+    --hash=sha256:15448bcfc4ef0f58c8e049f06cb10c296d75456ced02466dff3c82cc9c85f0a6 \
+    --hash=sha256:771171a4b7677ee791f74928030fb59ca83a1710d32eaec8395c5170fc520741 \
+    --hash=sha256:06e47faef940bc53ca23f5c6a29f5d4ebc47f0c7632f356da8ce4cc3ae99e908 \
+    --hash=sha256:730a4f2c028b33b3e6b1a3caa7a3048a1e1e6ff2fe9043acdb21b31a2e711742 \
+    --hash=sha256:1bf2299033c5a517014ffd5ec2e267f6a220d9095e75dd002dc33a898a7857cc \
+    --hash=sha256:5e7249bc0360d834b89631e83c1a7bbb28098b59fab9816e5e19efdef7b71a1c \
+    --hash=sha256:3971bdb5054257c922d95839d10ad347dcaa7137efeed34ce33ee660ea52b7e2 \
+    --hash=sha256:a8b431f82972cec974766a484eba02d7bbf6a5c042c13c25f1a23d4a3a31bfb4 \
+    --hash=sha256:a9281f0292131747f94219793438d78823bb72fbcafd1b415e99af1d8c42e11c \
+    --hash=sha256:502237c0ed9ca77212cf1673627fd2c361ee989cdde2ac54a0cd3f17cbc79e5a \
+    --hash=sha256:c63625ec36d1615fff69b068a95ea038d5f8df961901a097dfedc7e7410794d5 \
+    --hash=sha256:bda0a32d99ee1f86fcd46bbb10f43216f101df3349187ea8999967cddbfede86 \
+    --hash=sha256:a4a69088671eb31aa292a5996d9dd7a4ccb585b6fc7eb7b9e47051e1169fc479 \
+    --hash=sha256:0f7127b0034d5112b190de6bf46fadc41940983a91836acfdaa16c44f44beb75 \
+    --hash=sha256:9049c073f86155dfcd93434d63db80f753cd2e5bebf1d6172b112de215369b07 \
+    --hash=sha256:264dd80150f24a6fffb3ce5be32705e6a27160df055b3582925c2ed170f4f430 \
+    --hash=sha256:a05f899c311f6810ae4981edcd23d1587be207de554cf0530f8facbe836483cb \
+    --hash=sha256:91970de4b3dbf0b9b36745e9f346265d225d906188dec3d02c2179fbdb49b167 \
+    --hash=sha256:908cd59ae3c177c28e7a3eb519dade45748ba9af9959796c699f4f1b56caea8d \
+    --hash=sha256:f04fd7c4b7b4c0b97186f31a315fe88d20087a7148ff06a9c0348b35e39531f8 \
+    --hash=sha256:757dd412a49ea396b52b051c364bf8f9262dfa6665270f68208a0d6ed5999f1b \
+    --hash=sha256:7d6ab4507cf52328b27c57107491b2699a5e25097213a2d201fab0157cb5dd09 \
+    --hash=sha256:e3183550d129b7103914cad049a3b2358d9405c6e4baf3a7c92a82004f5e4814 \
+    --hash=sha256:9d1f63e2f4530a919ef87b4f1b3d814389604486f8b8c090aefccace4d1f98f8 \
+    --hash=sha256:8e88ebac371a388024dab3ccf393bf3c1790d21bc3c299d5a6f9f83fb823beda
 enum34==1.1.2 \
     --hash=sha256:2475d7fcddf5951e92ff546972758802de5260bf409319a9f1934e6bbc8b1dc7 \
     --hash=sha256:35907defb0f992b75ab7788f65fedc1cf20ffa22688e0e6f6f12afc06b3ea501
-funcsigs==0.4 \
-    --hash=sha256:ff5ad9e2f8d9e5d1e8bbfbcf47722ab527cf0d51caeeed9da6d0f40799383fde \
-    --hash=sha256:d83ce6df0b0ea6618700fe1db353526391a8a3ada1b7aba52fed7a61da772033
-idna==2.0 \
-    --hash=sha256:9b2fc50bd3c4ba306b9651b69411ef22026d4d8335b93afc2214cef1246ce707 \
-    --hash=sha256:16199aad938b290f5be1057c0e1efc6546229391c23cea61ca940c115f7d3d3b
+funcsigs==1.0.2 \
+    --hash=sha256:330cc27ccbf7f1e992e69fef78261dc7c6569012cf397db8d3de0234e6c937ca \
+    --hash=sha256:a7bb0f2cf3a3fd1ab2732cb49eba4252c2af4240442415b4abce3b87022a8f50
+idna==2.5 \
+    --hash=sha256:cc19709fd6d0cbfed39ea875d29ba6d4e22c0cebc510a76d6302a28385e8bb70 \
+    --hash=sha256:3cb5ce08046c4e3a560fc02f138d0ac63e00f8ce5901a56b32ec8b7994082aab
 ipaddress==1.0.16 \
     --hash=sha256:935712800ce4760701d89ad677666cd52691fd2f6f0b340c8b4239a3c17988a5 \
     --hash=sha256:5a3182b322a706525c46282ca6f064d27a02cffbd449f9f47416f1dc96aa71b0
 linecache2==1.0.0 \
     --hash=sha256:e78be9c0a0dfcbac712fe04fbf92b96cddae80b1b842f24248214c8496f006ef \
     --hash=sha256:4b26ff4e7110db76eeb6f5a7b64a82623839d595c2038eeda662f2a2db78e97c
-ndg-httpsclient==0.4.0 \
-    --hash=sha256:e8c155fdebd9c4bcb0810b4ed01ae1987554b1ee034dd7532d7b8fdae38a6274
 ordereddict==1.1 \
     --hash=sha256:1c35b4ac206cef2d24816c89f89cf289dd3d38cf7c449bb3fab7bf6d43f01b1f
+packaging==16.8 \
+    --hash=sha256:99276dc6e3a7851f32027a68f1095cd3f77c148091b092ea867a351811cfe388 \
+    --hash=sha256:5d50835fdf0a7edf0b55e311b7c887786504efea1177abd7e69329a8e5ea619e
 parsedatetime==2.1 \
     --hash=sha256:ce9d422165cf6e963905cd5f74f274ebf7cc98c941916169178ef93f0e557838 \
     --hash=sha256:17c578775520c99131634e09cfca5a05ea9e1bd2a05cd06967ebece10df7af2d
 pbr==1.8.1 \
     --hash=sha256:46c8db75ae75a056bd1cc07fa21734fe2e603d11a07833ecc1eeb74c35c72e0c \
     --hash=sha256:e2127626a91e6c885db89668976db31020f0af2da728924b56480fc7ccf09649
-psutil==3.3.0 \
-    --hash=sha256:584f0b29fcc5d523b433cb8918b2fc74d67e30ee0b44a95baf031528f424619f \
-    --hash=sha256:28ca0b6e9d99aa8dc286e8747a4471362b69812a25291de29b6a8d70a1545a0d \
-    --hash=sha256:167ad5fff52a672c4ddc1c1a0b25146d6813ebb08a9aab0a3ac45f8a5b669c3b \
-    --hash=sha256:e6dea6173a988727bb223d3497349ad5cdef5c0b282eff2d83e5f9065c53f85f \
-    --hash=sha256:2af5e0a4aad66049955d0734aa4e3dc8caa17a9eaf8b4c1a27a5f1ee6e40f6fc \
-    --hash=sha256:d9884dc0dc2e55e2448e495778dc9899c1c8bf37aeb2f434c1bea74af93c2683 \
-    --hash=sha256:e27c2fe6dfcc8738be3d2c5a022f785eb72971057e1a9e1e34fba73bce8a71a6 \
-    --hash=sha256:65afd6fecc8f3aed09ee4be63583bc8eb472f06ceaa4fe24c4d1d5a1a3c0e13f \
-    --hash=sha256:ba1c558fbfcdf94515c2394b1155c1dc56e2bc2a9c17d30349827c9ed8a67e46 \
-    --hash=sha256:ba95ea0022dcb64d36f0c1335c0605fae35bdf3e0fea8d92f5d0f6456a35e55b \
-    --hash=sha256:421b6591d16b509aaa8d8c15821d66bb94cb4a8dc4385cad5c51b85d4a096d85 \
-    --hash=sha256:326b305cbdb6f94dafbfe2c26b11da88b0ab07b8a07f8188ab9d75ff0c6e841a \
-    --hash=sha256:9aede5b2b6fe46b3748ea8e5214443890d1634027bef3d33b7dad16556830278 \
-    --hash=sha256:73bed1db894d1aa9c3c7e611d302cdeab7ae8a0dc0eeaf76727878db1ac5cd87 \
-    --hash=sha256:935b5dd6d558af512f42501a7c08f41d7aff139af1bb3959daa3abb859234d6c \
-    --hash=sha256:4ca0111cf157dcc0f2f69a323c5b5478718d68d45fc9435d84be0ec0f186215b \
-    --hash=sha256:b6f13c95398a3fcf0226c4dcfa448560ba5865259cd96ec2810658651e932189 \
-    --hash=sha256:ee6be30d1635bbdea4c4325d507dc8a0dbbde7e1c198bd62ddb9f43198b9e214 \
-    --hash=sha256:dfa786858c268d7fbbe1b6175e001ec02738d7cfae0a7ce77bf9b651af676729 \
-    --hash=sha256:aa77f9de72af9c16cc288cd4a24cf58824388f57d7a81e400c4616457629870e \
-    --hash=sha256:f500093357d04da8140d87932cac2e54ef592a54ca8a743abb2850f60c2c22eb
-pyasn1==0.1.9 \
-    --hash=sha256:61f9d99e3cef65feb1bfe3a2eef7a93eb93819d345bf54bcd42f4e63d5204dae \
-    --hash=sha256:1802a6dd32045e472a419db1441aecab469d33e0d2749e192abdec52101724af \
-    --hash=sha256:35025cd9422c96504912f04e2f15fe79390a8597b430c2ca5d0534cf9309ffa0 \
-    --hash=sha256:2f96ed5a0c329ca16230b326ca12b7461ec8f65e0be3e4f997516f36bf82a345 \
-    --hash=sha256:28fee44217991cfad9e6a0b9f7e3f26041e21ebc96629e94e585ccd05d49fa65 \
-    --hash=sha256:326e7a854a17fab07691204747695f8f692d674588a355c441fb14f660bf4e68 \
-    --hash=sha256:cda5a90485709ca6795c86056c3e5fe7266028b05e53f1d527fdf93a6365a6b8 \
-    --hash=sha256:0cb2a14742b543fdd68f931a14ce3829186ed2b1b2267a06787388c96b2dd9be \
-    --hash=sha256:5191ff6b9126d2c039dd87f8ff025bed274baf07fa78afa46f556b1ad7265d6e \
-    --hash=sha256:8323e03637b2d072cc7041300bac6ec448c3c28950ab40376036788e9a1af629 \
-    --hash=sha256:853cacd96d1f701ddd67aa03ecc05f51890135b7262e922710112f12a2ed2a7f
-pyOpenSSL==0.15.1 \
-    --hash=sha256:88e45e6bb25dfed272a1ef2e728461d44b634c2cd689e989b6e56a349c5a3ae5 \
-    --hash=sha256:f0a26070d6db0881de8bcc7846934b7c3c930d8f9c79d45883ee48984bc0d672
+pyOpenSSL==16.2.0 \
+    --hash=sha256:26ca380ddf272f7556e48064bbcd5bd71f83dfc144f3583501c7ddbd9434ee17 \
+    --hash=sha256:7779a3bbb74e79db234af6a08775568c6769b5821faecf6e2f4143edb227516e
+pyparsing==2.1.8 \
+    --hash=sha256:2f0f5ceb14eccd5aef809d6382e87df22ca1da583c79f6db01675ce7d7f49c18 \
+    --hash=sha256:03a4869b9f3493807ee1f1cb405e6d576a1a2ca4d81a982677c0c1ad6177c56b \
+    --hash=sha256:ab09aee814c0241ff0c503cff30018219fe1fc14501d89f406f4664a0ec9fbcd \
+    --hash=sha256:6e9a7f052f8e26bcf749e4033e3115b6dc7e3c85aafcb794b9a88c9d9ef13c97 \
+    --hash=sha256:9f463a6bcc4eeb6c08f1ed84439b17818e2085937c0dee0d7674ac127c67c12b \
+    --hash=sha256:3626b4d81cfb300dad57f52f2f791caaf7b06c09b368c0aa7b868e53a5775424 \
+    --hash=sha256:367b90cc877b46af56d4580cd0ae278062903f02b8204ab631f5a2c0f50adfd0 \
+    --hash=sha256:9f1ea360086cd68681e7f4ca8f1f38df47bf81942a0d76a9673c2d23eff35b13
 pyRFC3339==1.0 \
     --hash=sha256:eea31835c56e2096af4363a5745a784878a61d043e247d3a6d6a0a32a9741f56 \
     --hash=sha256:8dfbc6c458b8daba1c0f3620a8c78008b323a268b27b7359e92a4ae41325f535
 python-augeas==0.5.0 \
     --hash=sha256:67d59d66cdba8d624e0389b87b2a83a176f21f16a87553b50f5703b23f29bac2
-python2-pythondialog==3.3.0 \
-    --hash=sha256:04e93f24995c43dd90f338d5d865ca72ce3fb5a5358d4daa4965571db35fc3ec \
-    --hash=sha256:3e6f593fead98f8a526bc3e306933533236e33729f552f52896ea504f55313fa
 pytz==2015.7 \
     --hash=sha256:3abe6a6d3fc2fbbe4c60144211f45da2edbe3182a6f6511af6bbba0598b1f992 \
     --hash=sha256:939ef9c1e1224d980405689a97ffcf7828c56d1517b31d73464356c1f2b7769e \
@@ -704,9 +815,9 @@ pytz==2015.7 \
     --hash=sha256:fbd26746772c24cb93c8b97cbdad5cb9e46c86bbdb1b9d8a743ee00e2fb1fc5d \
     --hash=sha256:99266ef30a37e43932deec2b7ca73e83c8dbc3b9ff703ec73eca6b1dae6befea \
     --hash=sha256:8b6ce1c993909783bc96e0b4f34ea223bff7a4df2c90bdb9c4e0f1ac928689e3
-requests==2.9.1 \
-    --hash=sha256:113fbba5531a9e34945b7d36b33a084e8ba5d0664b703c81a7c572d91919a5b8 \
-    --hash=sha256:c577815dd00f1394203fc44eb979724b098f88264a9ef898ee45b8e5e9cf587f
+requests==2.12.1 \
+    --hash=sha256:3f3f27a9d0f9092935efc78054ef324eb9f8166718270aefe036dfa1e4f68e1e \
+    --hash=sha256:2109ecea94df90980be040490ff1d879971b024861539abb00054062388b612e
 six==1.10.0 \
     --hash=sha256:0ff78c403d9bccf5a425a6d31a12aa6b47f1c21ca4dc2573a7e2f32a97335eb1 \
     --hash=sha256:105f8d68616f8248e24bf0e9372ef04d3cc10104f1980f54d57b2ce73a5ad56a
@@ -738,24 +849,33 @@ zope.interface==4.1.3 \
     --hash=sha256:928138365245a0e8869a5999fbcc2a45475a0a6ed52a494d60dbdc540335fedd \
     --hash=sha256:0d841ba1bb840eea0e6489dc5ecafa6125554971f53b5acb87764441e61bceba \
     --hash=sha256:b09c8c1d47b3531c400e0195697f1414a63221de6ef478598a4f1460f7d9a392
-mock==1.0.1 \
-    --hash=sha256:b839dd2d9c117c701430c149956918a423a9863b48b09c90e30a6013e7d2f44f \
-    --hash=sha256:8f83080daa249d036cbccfb8ae5cc6ff007b88d6d937521371afabe7b19badbc
+mock==2.0.0 \
+    --hash=sha256:5ce3c71c5545b472da17b72268978914d0252980348636840bd34a00b5cc96c1 \
+    --hash=sha256:b158b6df76edd239b8208d481dc46b6afd45a846b7812ff0ce58971cf5bc8bba
+
+# Contains the requirements for the letsencrypt package.
+#
+# Since the letsencrypt package depends on certbot and using pip with hashes
+# requires that all installed packages have hashes listed, this allows
+# dependency-requirements.txt to be used without requiring a hash for a
+# (potentially unreleased) Certbot package.
+
 letsencrypt==0.7.0 \
     --hash=sha256:105a5fb107e45bcd0722eb89696986dcf5f08a86a321d6aef25a0c7c63375ade \
     --hash=sha256:c36e532c486a7e92155ee09da54b436a3c420813ec1c590b98f635d924720de9
 
-# THE LINES BELOW ARE EDITED BY THE RELEASE SCRIPT; ADD ALL DEPENDENCIES ABOVE.
-
-acme==0.8.1 \
-    --hash=sha256:ccd7883772efbf933f91713b8241455993834f3620c8fbd459d9ed5e50bbaaca \
-    --hash=sha256:d3ea4acf280bf6253ad7d641cb0970f230a19805acfed809e7a8ddcf62157d9f
-certbot==0.8.1 \
-    --hash=sha256:89805d9f70249ae859ec4d7a99c00b4bb7083ca90cd12d4d202b76dfc284f7c5 \
-    --hash=sha256:6ca8df3d310ced6687d38aac17c0fb8c1b2ec7a3bea156a254e4cc2a1c132771
-certbot-apache==0.8.1 \
-    --hash=sha256:c9e3fdc15e65589c2e39eb0e6b1f61f0c0a1db3c17b00bb337f0ff636cc61cb3 \
-    --hash=sha256:0faf2879884d3b7a58b071902fba37d4b8b58a50e2c3b8ac262c0a74134045ed
+certbot==0.15.0 \
+    --hash=sha256:f052a1ee9d0e71b73d893c26ee3aa343f6f3abe7de8471437779d541f8bf7824 \
+    --hash=sha256:b8c4043b2b8df39660d4ce4a2a6eca590f98ece0e1b97eba53ab95f3bbac3beb
+acme==0.15.0 \
+    --hash=sha256:d423a14a8fde089d6854ccbe1314f6a80553ef06799ac6f671b90d8399835e60 \
+    --hash=sha256:9fadd63322a1eb95f58e6cda8ca2095c750e828ae470bc6e3925ef618c7cfc87
+certbot-apache==0.15.0 \
+    --hash=sha256:07fa99b264e0ea489695cc2a5353f3fe9459422ad549de02c46da24ae546acd9 \
+    --hash=sha256:6da1433381bd2c2ea7c395be57ca1bcdb7c1c04ce3d12b67a3fa207a3bfa41ca
+certbot-nginx==0.15.0 \
+    --hash=sha256:7b0622f8a9031e24105f9b5c8d98d4ed83ae393517ed35cc2a4fa50098122922 \
+    --hash=sha256:0b98dedb22492d6f88dffdfbd721b4d4c98bfe361df35bc97bf5bd3047f01234
 
 UNLIKELY_EOF
     # -------------------------------------------------------------------------
@@ -912,22 +1032,49 @@ UNLIKELY_EOF
     # Set PATH so pipstrap upgrades the right (v)env:
     PATH="$VENV_BIN:$PATH" "$VENV_BIN/python" "$TEMP_DIR/pipstrap.py"
     set +e
-    PIP_OUT=`"$VENV_BIN/pip" install --no-cache-dir --require-hashes -r "$TEMP_DIR/letsencrypt-auto-requirements.txt" 2>&1`
+    if [ "$VERBOSE" = 1 ]; then
+      "$VENV_BIN/pip" install --no-cache-dir --require-hashes -r "$TEMP_DIR/letsencrypt-auto-requirements.txt"
+    else
+      PIP_OUT=`"$VENV_BIN/pip" install --no-cache-dir --require-hashes -r "$TEMP_DIR/letsencrypt-auto-requirements.txt" 2>&1`
+    fi
     PIP_STATUS=$?
     set -e
     if [ "$PIP_STATUS" != 0 ]; then
       # Report error. (Otherwise, be quiet.)
-      echo "Had a problem while installing Python packages:"
-      echo "$PIP_OUT"
+      error "Had a problem while installing Python packages."
+      if [ "$VERBOSE" != 1 ]; then
+        error
+        error "pip prints the following errors: "
+        error "====================================================="
+        error "$PIP_OUT"
+        error "====================================================="
+        error
+        error "Certbot has problem setting up the virtual environment."
+
+        if `echo $PIP_OUT | grep -q Killed` || `echo $PIP_OUT | grep -q "allocate memory"` ; then
+          error
+          error "Based on your pip output, the problem can likely be fixed by "
+          error "increasing the available memory."
+        else
+          error
+          error "We were not be able to guess the right solution from your pip "
+          error "output."
+        fi
+
+        error
+        error "Consult https://certbot.eff.org/docs/install.html#problems-with-python-virtual-environment"
+        error "for possible solutions."
+        error "You may also find some support resources at https://certbot.eff.org/support/ ."
+      fi
       rm -rf "$VENV_PATH"
       exit 1
     fi
-    echo "Installation succeeded."
+    say "Installation succeeded."
   fi
   if [ -n "$SUDO" ]; then
     # SUDO is su wrapper or sudo
-    echo "Requesting root privileges to run certbot..."
-    echo "  $VENV_BIN/letsencrypt" "$@"
+    say "Requesting root privileges to run certbot..."
+    say "  $VENV_BIN/letsencrypt" "$@"
   fi
   if [ -z "$SUDO_ENV" ] ; then
     # SUDO is su wrapper / noop
@@ -938,7 +1085,7 @@ UNLIKELY_EOF
   fi
 
 else
-  # Phase 1: Upgrade certbot-auto if neceesary, then self-invoke.
+  # Phase 1: Upgrade certbot-auto if necessary, then self-invoke.
   #
   # Each phase checks the version of only the thing it is responsible for
   # upgrading. Phase 1 checks the version of the latest release of
@@ -954,7 +1101,7 @@ else
     Bootstrap
   fi
   if [ "$OS_PACKAGES_ONLY" = 1 ]; then
-    echo "OS packages installed."
+    say "OS packages installed."
     exit 0
   fi
 
@@ -967,7 +1114,7 @@ else
 
     # Print latest released version of LE to stdout:
     python fetch.py --latest-version
-    
+
     # Download letsencrypt-auto script from git tag v1.2.3 into the folder I'm
     # in, and make sure its signature verifies:
     python fetch.py --le-auto-script v1.2.3
@@ -975,6 +1122,9 @@ else
 On failure, return non-zero.
 
 """
+
+from __future__ import print_function
+
 from distutils.version import LooseVersion
 from json import loads
 from os import devnull, environ
@@ -1076,12 +1226,12 @@ def main():
     flag = argv[1]
     try:
         if flag == '--latest-version':
-            print latest_stable_version(get)
+            print(latest_stable_version(get))
         elif flag == '--le-auto-script':
             tag = argv[2]
             verified_new_le_auto(get, tag, dirname(argv[0]))
     except ExpectedError as exc:
-        print exc.args[0], exc.args[1]
+        print(exc.args[0], exc.args[1])
         return 1
     else:
         return 0
@@ -1094,9 +1244,9 @@ UNLIKELY_EOF
     # ---------------------------------------------------------------------------
     DeterminePythonVersion
     if ! REMOTE_VERSION=`"$LE_PYTHON" "$TEMP_DIR/fetch.py" --latest-version` ; then
-      echo "WARNING: unable to check for updates."
+      error "WARNING: unable to check for updates."
     elif [ "$LE_AUTO_VERSION" != "$REMOTE_VERSION" ]; then
-      echo "Upgrading certbot-auto $LE_AUTO_VERSION to $REMOTE_VERSION..."
+      say "Upgrading certbot-auto $LE_AUTO_VERSION to $REMOTE_VERSION..."
 
       # Now we drop into Python so we don't have to install even more
       # dependencies (curl, etc.), for better flow control, and for the option of
@@ -1105,9 +1255,9 @@ UNLIKELY_EOF
 
       # Install new copy of certbot-auto.
       # TODO: Deal with quotes in pathnames.
-      echo "Replacing certbot-auto..."
+      say "Replacing certbot-auto..."
       # Clone permissions with cp. chmod and chown don't have a --reference
-      # option on OS X or BSD, and stat -c on Linux is stat -f on OS X and BSD:
+      # option on macOS or BSD, and stat -c on Linux is stat -f on macOS and BSD:
       $SUDO cp -p "$0" "$TEMP_DIR/letsencrypt-auto.permission-clone"
       $SUDO cp "$TEMP_DIR/letsencrypt-auto" "$TEMP_DIR/letsencrypt-auto.permission-clone"
       # Using mv rather than cp leaves the old file descriptor pointing to the
